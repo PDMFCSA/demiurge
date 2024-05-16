@@ -319,7 +319,7 @@ async function associateGroupAccess(sharedEnclave, groupType) {
     };
     await apiKeyClient.associateAPIKey(
         constants.APPS.DSU_FABRIC,
-        groupType,
+        constants.API_KEY_NAME,
         getUserIdFromUsername(memberObject.username),
         JSON.stringify(apiKey)
     );
@@ -432,25 +432,22 @@ function hideTextLoader() {
 }
 
 function getUserIdFromUsername(username) {
-  let user = '';
-  let domain = '';
-
-  // Check if the input string contains an '@' symbol
-  if (username.includes('@')) {
-    // If '@' is present, split the string based on '/' and '@'
-    const userDomain = username.split('/')[1];
-    [user, domain] = userDomain.split('@');
-  } else {
-    // If '@' is not present, assume format is 'prefix/username/domainWithExtra'
-    const parts = username.split('/');
-    user = parts[1];
-    domain = parts[2];
+  const DSU_FABRIC = 'DSU_Fabric/';
+  const DEMIURGE = 'Demiurge/';
+  // if DSU_FABRIC username format:  DSU_Fabric/user@domain
+  if (username.includes(DSU_FABRIC)) {
+    username = username.replace(DSU_FABRIC, '');
+    if (username.includes('@')) {
+      username = username.replace(/\d+$/, '');
+    }
+  } else if (username.includes(DEMIURGE)) {
+    username = username.replace(DEMIURGE, '');
+    if (username.includes('/')) {
+      username = username.replace(/\d+$/, '');
+      username = username.replaceAll("/", "@");
+    }
   }
-
-  // Clean the domain by removing any trailing numbers using a regex
-  domain = domain.replace(/\d+$/, '');
-
-  return `${user}@${domain}`;
+  return username;
 }
 
 const setSharedEnclaveKey = async (key, value) => {
@@ -496,6 +493,28 @@ async function migrateData(sharedEnclave){
   const apiKeyClient = apiKeySpace.getAPIKeysClient();
   try {
     notificationHandler.reportUserRelevantInfo(`System Alert: Migration of Access Control Mechanisms is Currently Underway. Your Patience is Appreciated.`);
+    let did = await getStoredDID();
+    try {
+      const sysadminSecret = await getBreakGlassRecoveryCode();
+      const apiKey = crypto.sha256JOSE(crypto.generateRandom(32), "base64");
+      const body = {
+        secret: sysadminSecret,
+        apiKey
+      }
+      await apiKeyClient.becomeSysAdmin(JSON.stringify(body));
+      await setSysadminCreated(true);
+    }catch (e) {
+      console.log(e);
+      // already sysadmin
+    }
+    let groupDIDDocument = await $$.promisify(w3cdid.resolveDID)(adminGroup.did);
+    const members = await $$.promisify(groupDIDDocument.getMembers)();
+    for (let member in members) {
+      const memberObject = members[member];
+      if (member !== did) {
+        await apiKeyClient.makeSysAdmin(getUserIdFromUsername(memberObject.username), crypto.generateRandom(32).toString("base64"));
+      }
+    }
     const epiEnclaveRecord = await $$.promisify(sharedEnclave.readKey)(constants.EPI_SHARED_ENCLAVE);
     let enclaveKeySSI = epiEnclaveRecord.enclaveKeySSI;
     let response
@@ -514,27 +533,6 @@ async function migrateData(sharedEnclave){
       notificationHandler.reportUserRelevantError(`Failed to migrate Access Control Mechanisms.`);
       return;
     }
-    let did = await getStoredDID();
-    try {
-      const sysadminSecret = await getBreakGlassRecoveryCode();
-      const apiKey = crypto.sha256JOSE(crypto.generateRandom(32), "base64");
-      const body = {
-        secret: sysadminSecret,
-        apiKey
-      }
-      await apiKeyClient.becomeSysAdmin(JSON.stringify(body));
-      await setSysadminCreated(true);
-    }catch (e) {
-      // already sysadmin
-    }
-    let groupDIDDocument = await $$.promisify(w3cdid.resolveDID)(adminGroup.did);
-    const members = await $$.promisify(groupDIDDocument.getMembers)();
-    for (let member in members) {
-      const memberObject = members[member];
-      if (member !== did) {
-        await apiKeyClient.makeSysAdmin(getUserIdFromUsername(memberObject.username), crypto.generateRandom(32).toString("base64"));
-      }
-    }
   }catch (e) {
     console.log(e);
     notificationHandler.reportUserRelevantError(`Failed to migrate Access Control Mechanisms.`);
@@ -547,10 +545,9 @@ async function migrateData(sharedEnclave){
   }
 
   await assignAccessToGroups(sharedEnclave);
-  notificationHandler.reportUserRelevantInfo(`Migration of Access Control Mechanisms successfully!`);
 }
 
-async function doMigration(sharedEnclave) {
+async function doMigration(sharedEnclave, force = false) {
   function showMigrationDialog() {
     // Check if the dialog already exists
     let dialog = document.getElementById('migrationDialog');
@@ -581,10 +578,13 @@ async function doMigration(sharedEnclave) {
     if (dialog) {
       dialog.style.display = 'none';
     }
-
   }
+
   if (!sharedEnclave) {
     sharedEnclave = await $$.promisify(scAPI.getSharedEnclave)();
+  }
+  if(force){
+    await migrateData(sharedEnclave);
   }
   let response = await fetch(`${window.location.origin}/getMigrationStatus`);
   if (response.status !== 200) {
@@ -595,11 +595,16 @@ async function doMigration(sharedEnclave) {
 
   if (migrationStatus === constants.MIGRATION_STATUS.NOT_STARTED) {
     await migrateData(sharedEnclave);
-    return;
   }
 
-
   const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+  response = await fetch(`${window.location.origin}/getMigrationStatus`);
+  if (response.status !== 200) {
+    throw new Error(`Failed to check migration status. HTTP status: ${response.status}`);
+  }
+
+  migrationStatus = await response.text();
 
   if (migrationStatus === constants.MIGRATION_STATUS.IN_PROGRESS) {
     showMigrationDialog();
@@ -616,12 +621,16 @@ async function doMigration(sharedEnclave) {
 
     if (migrationStatus === constants.MIGRATION_STATUS.COMPLETED) {
       hideMigrationDialog();
-      console.log('Migration completed successfully.');
+      notificationHandler.reportUserRelevantInfo(`Migration of Access Control Mechanisms successfully executed !`);
+      return;
+    }
+
+    if (migrationStatus === constants.MIGRATION_STATUS.FAILED) {
+      hideMigrationDialog();
+      notificationHandler.reportUserRelevantError(`Failed to migrate Access Control Mechanisms.`);
       return;
     }
   }
-
-  console.log('Migration completed successfully.');
 }
 
 
